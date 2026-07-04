@@ -1,70 +1,187 @@
 """Flask app for resume upload and skill extraction."""
 
-from flask import Flask, render_template_string, request, redirect, url_for, flash, session
+from flask import (
+    Flask,
+    render_template_string,
+    request,
+    redirect,
+    url_for,
+    flash,
+    session,
+)
 import os
 import base64
 import uuid
 import datetime
 import re
-import boto3
+import json
+from decimal import Decimal
+
+try:
+    import boto3
+    from botocore.exceptions import ClientError
+except Exception as exc:
+    boto3 = None
+    ClientError = Exception
+    print(f"[AWS IMPORT ERROR] {exc}")
+
 import spacy
-from botocore.exceptions import ClientError
 from docx import Document
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
 app = Flask(__name__)
-app.secret_key = 'Ffe6dXyDaFb9eqVyHinxT04U9I9/80PDyS/roJLH'
+app.secret_key = "Ffe6dXyDaFb9eqVyHinxT04U9I9/80PDyS/roJLH"
 
 # AWS DynamoDB setup
-_dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-_RESUMES_TABLE_NAME = 'resumes'
-_SKILLS_TABLE_NAME = 'skills'
-_ALLOWED_EXTENSIONS = {'.pdf', '.docx'}
+if boto3 is None:
+    _dynamodb = None
+else:
+    _dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+_RESUMES_TABLE_NAME = "resumes"
+_SKILLS_TABLE_NAME = "skills"
+_JOBS_TABLE_NAME = "jobs"
+_ALLOWED_EXTENSIONS = {".pdf", ".docx"}
 _MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
-_JOB_CATALOG = [
-    {'title': 'Python Developer', 'description': 'backend development using python flask django api services and data workflows.', 'skills': ['python', 'flask', 'django', 'api', 'backend']},
-    {'title': 'Cloud Engineer', 'description': 'cloud infrastructure automation deployment aws docker kubernetes and devops operations.', 'skills': ['aws', 'docker', 'kubernetes', 'devops', 'cloud']},
-    {'title': 'Data Analyst', 'description': 'sql data analysis dashboards reporting and business intelligence using data tools.', 'skills': ['sql', 'data analysis', 'power bi', 'tableau', 'analytics']},
-    {'title': 'Frontend Developer', 'description': 'react javascript typescript html css user interface and web applications.', 'skills': ['react', 'javascript', 'typescript', 'html', 'css']},
-    {'title': 'AI / ML Engineer', 'description': 'machine learning ai model building data science and predictive analytics.', 'skills': ['machine learning', 'ai', 'python', 'data science']},
-]
+_JOB_CATALOG = []
 _JOB_MATCHING_OPTIONS = {
-    'balanced': 'Balanced',
-    'strict': 'Strict',
-    'advanced': 'Advanced'
+    "balanced": "Balanced",
+    "strict": "Strict",
+    "advanced": "Advanced",
 }
 _SKILL_KEYWORDS = [
-    'python', 'flask', 'django', 'java', 'javascript', 'typescript', 'html', 'css',
-    'react', 'node.js', 'node', 'sql', 'mysql', 'postgresql', 'mongodb', 'aws',
-    'azure', 'docker', 'kubernetes', 'git', 'github', 'rest api', 'api', 'machine learning',
-    'ai', 'data analysis', 'testing', 'pytest', 'c++', 'c#', 'php', 'bootstrap',
-    'linux', 'bash', 'selenium', 'dynamodb', 'boto3', 'power bi', 'tableau'
+    "python",
+    "flask",
+    "django",
+    "java",
+    "javascript",
+    "typescript",
+    "html",
+    "css",
+    "react",
+    "node.js",
+    "node",
+    "sql",
+    "mysql",
+    "postgresql",
+    "mongodb",
+    "aws",
+    "azure",
+    "docker",
+    "kubernetes",
+    "git",
+    "github",
+    "rest api",
+    "api",
+    "machine learning",
+    "ai",
+    "data analysis",
+    "testing",
+    "pytest",
+    "c++",
+    "c#",
+    "php",
+    "bootstrap",
+    "linux",
+    "bash",
+    "selenium",
+    "dynamodb",
+    "boto3",
+    "power bi",
+    "tableau",
 ]
 
 try:
-    _NLP = spacy.load('en_core_web_sm')
+    _NLP = spacy.load("en_core_web_sm")
 except OSError:
     _NLP = None
+
+
+def load_jobs_from_json():
+    """Load job descriptions from jobs.json file."""
+    jobs_file = os.path.join(os.path.dirname(__file__), "jobs.json")
+    try:
+        with open(jobs_file, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"[WARNING] {jobs_file} not found. Using empty job catalog.")
+        return []
+    except json.JSONDecodeError as exc:
+        print(f"[ERROR] Failed to parse {jobs_file}: {exc}")
+        return []
+
+
+def ensure_jobs_table():
+    """Create the jobs table in DynamoDB if it does not exist."""
+    if boto3 is None or _dynamodb is None:
+        return None
+    client = boto3.client("dynamodb", region_name="us-east-1")
+    try:
+        client.describe_table(TableName=_JOBS_TABLE_NAME)
+        return _dynamodb.Table(_JOBS_TABLE_NAME)
+    except client.exceptions.ResourceNotFoundException:
+        client.create_table(
+            TableName=_JOBS_TABLE_NAME,
+            AttributeDefinitions=[{"AttributeName": "job_id", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "job_id", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
+        )
+        waiter = client.get_waiter("table_exists")
+        waiter.wait(TableName=_JOBS_TABLE_NAME)
+        return _dynamodb.Table(_JOBS_TABLE_NAME)
+
+
+def convert_embedding_for_dynamodb(value):
+    """Convert numpy/float embedding values to DynamoDB-compatible Decimal values."""
+    if isinstance(value, list):
+        return [convert_embedding_for_dynamodb(item) for item in value]
+    if isinstance(value, (float, int)):
+        return Decimal(str(value))
+    return value
+
+
+def sync_jobs_to_dynamodb(jobs):
+    """Sync job descriptions from JSON to DynamoDB."""
+    if not jobs or boto3 is None or _dynamodb is None:
+        return
+    try:
+        jobs_table = ensure_jobs_table()
+        for job in jobs:
+            sanitized_job = dict(job)
+            if "embedding" in sanitized_job:
+                sanitized_job["embedding"] = convert_embedding_for_dynamodb(
+                    sanitized_job["embedding"]
+                )
+            jobs_table.put_item(Item=sanitized_job)
+        print(f"[JOBS] Synced {len(jobs)} jobs to DynamoDB")
+    except ClientError as exc:
+        print(f"[JOBS ERROR] Failed to sync jobs to DynamoDB: {exc}")
+
+
+_JOB_CATALOG = load_jobs_from_json()
+if _JOB_CATALOG:
+    sync_jobs_to_dynamodb(_JOB_CATALOG)
 
 
 def ensure_resumes_table():
     """
     Create the resumes table if it does not exist yet.
     """
-    client = boto3.client('dynamodb', region_name='us-east-1')
+    if boto3 is None or _dynamodb is None:
+        return None
+    client = boto3.client("dynamodb", region_name="us-east-1")
     try:
         client.describe_table(TableName=_RESUMES_TABLE_NAME)
         return _dynamodb.Table(_RESUMES_TABLE_NAME)
     except client.exceptions.ResourceNotFoundException:
         client.create_table(
             TableName=_RESUMES_TABLE_NAME,
-            AttributeDefinitions=[{'AttributeName': 'resume_id', 'AttributeType': 'S'}],
-            KeySchema=[{'AttributeName': 'resume_id', 'KeyType': 'HASH'}],
-            BillingMode='PAY_PER_REQUEST'
+            AttributeDefinitions=[{"AttributeName": "resume_id", "AttributeType": "S"}],
+            KeySchema=[{"AttributeName": "resume_id", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
         )
-        waiter = client.get_waiter('table_exists')
+        waiter = client.get_waiter("table_exists")
         waiter.wait(TableName=_RESUMES_TABLE_NAME)
         return _dynamodb.Table(_RESUMES_TABLE_NAME)
 
@@ -74,22 +191,22 @@ def extract_text_from_resume(file_path, ext):
     Extract plain text from a PDF or DOCX resume file.
     """
     try:
-        if ext == '.pdf':
+        if ext == ".pdf":
             reader = PdfReader(file_path)
-            return '\n'.join(page.extract_text() or '' for page in reader.pages)
-        if ext == '.docx':
+            return "\n".join(page.extract_text() or "" for page in reader.pages)
+        if ext == ".docx":
             doc = Document(file_path)
-            return '\n'.join(paragraph.text for paragraph in doc.paragraphs)
+            return "\n".join(paragraph.text for paragraph in doc.paragraphs)
     except Exception as exc:
-        print(f'[RESUME TEXT ERROR] {exc}')
-    return ''
+        print(f"[RESUME TEXT ERROR] {exc}")
+    return ""
 
 
 def extract_skills(resume_text):
     """
     Use NLP to extract likely skills from the resume text.
     """
-    text = (resume_text or '').lower()
+    text = (resume_text or "").lower()
     if not text:
         return []
 
@@ -99,7 +216,9 @@ def extract_skills(resume_text):
         doc = _NLP(resume_text)
         for chunk in doc.noun_chunks:
             phrase = chunk.text.strip().lower()
-            if len(phrase.split()) <= 3 and any(skill in phrase for skill in _SKILL_KEYWORDS):
+            if len(phrase.split()) <= 3 and any(
+                skill in phrase for skill in _SKILL_KEYWORDS
+            ):
                 found.add(phrase)
 
         for token in doc:
@@ -111,28 +230,42 @@ def extract_skills(resume_text):
 
     # Fallback: simple keyword search if NLP model is unavailable or returns no results.
     if not found:
-        clean_text = re.sub(r'[^a-zA-Z0-9+#.\-/\s]', ' ', text)
+        clean_text = re.sub(r"[^a-zA-Z0-9+#.\-/\s]", " ", text)
         for skill in _SKILL_KEYWORDS:
-            if re.search(r'\b' + re.escape(skill.lower()) + r'\b', clean_text):
+            if re.search(r"\b" + re.escape(skill.lower()) + r"\b", clean_text):
                 found.add(skill)
 
-    return sorted(found, key=lambda item: (_SKILL_KEYWORDS.index(item) if item in _SKILL_KEYWORDS else len(_SKILL_KEYWORDS), item))
+    return sorted(
+        found,
+        key=lambda item: (
+            (
+                _SKILL_KEYWORDS.index(item)
+                if item in _SKILL_KEYWORDS
+                else len(_SKILL_KEYWORDS)
+            ),
+            item,
+        ),
+    )
 
 
 def ensure_skills_table():
     """Create the skills table if it does not exist yet."""
-    client = boto3.client('dynamodb', region_name='us-east-1')
+    if boto3 is None or _dynamodb is None:
+        return None
+    client = boto3.client("dynamodb", region_name="us-east-1")
     try:
         client.describe_table(TableName=_SKILLS_TABLE_NAME)
         return _dynamodb.Table(_SKILLS_TABLE_NAME)
     except client.exceptions.ResourceNotFoundException:
         client.create_table(
             TableName=_SKILLS_TABLE_NAME,
-            AttributeDefinitions=[{'AttributeName': 'user_email', 'AttributeType': 'S'}],
-            KeySchema=[{'AttributeName': 'user_email', 'KeyType': 'HASH'}],
-            BillingMode='PAY_PER_REQUEST'
+            AttributeDefinitions=[
+                {"AttributeName": "user_email", "AttributeType": "S"}
+            ],
+            KeySchema=[{"AttributeName": "user_email", "KeyType": "HASH"}],
+            BillingMode="PAY_PER_REQUEST",
         )
-        waiter = client.get_waiter('table_exists')
+        waiter = client.get_waiter("table_exists")
         waiter.wait(TableName=_SKILLS_TABLE_NAME)
         return _dynamodb.Table(_SKILLS_TABLE_NAME)
 
@@ -141,10 +274,16 @@ def get_resume_record(resume_id):
     """
     Fetch a saved resume item from DynamoDB using its resume_id.
     """
+    if _dynamodb is None:
+        return None
     try:
-        return _dynamodb.Table(_RESUMES_TABLE_NAME).get_item(Key={'resume_id': resume_id}).get('Item')
+        return (
+            _dynamodb.Table(_RESUMES_TABLE_NAME)
+            .get_item(Key={"resume_id": resume_id})
+            .get("Item")
+        )
     except ClientError as exc:
-        print(f'[RESUME FETCH ERROR] {exc}')
+        print(f"[RESUME FETCH ERROR] {exc}")
         return None
 
 
@@ -158,7 +297,10 @@ def calculate_resume_score(skills, text):
         score += 20
     if text and len(text.split()) >= 150:
         score += 20
-    if any(skill in skills for skill in ['python', 'aws', 'sql', 'flask', 'django', 'docker']):
+    if any(
+        skill in skills
+        for skill in ["python", "aws", "sql", "flask", "django", "docker"]
+    ):
         score += 15
     if len(skills) >= 5:
         score += 5
@@ -166,44 +308,124 @@ def calculate_resume_score(skills, text):
 
 
 try:
-    _EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    _EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 except Exception as exc:
-    print(f'[EMBEDDING MODEL ERROR] {exc}')
+    print(f"[EMBEDDING MODEL ERROR] {exc}")
     _EMBEDDING_MODEL = None
 
 
-def match_jobs_with_ml(skills):
-    """Rank job roles using sentence-transformers embeddings and cosine similarity."""
-    resume_text = ' '.join(skill.lower() for skill in skills if skill) if skills else 'software developer engineer'
-    job_profiles = [
-        ' '.join([item['title'], item['description'], ' '.join(item['skills'])])
-        for item in _JOB_CATALOG
-    ]
+def _normalize_text(text):
+    """Return a compact lowercase token string for matching."""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
 
-    if _EMBEDDING_MODEL is None:
+
+def _build_job_search_text(job):
+    """Create a search string from a job record for embedding and keyword matching."""
+    title = job.get("title", "")
+    description = job.get("description", "")
+    skills = " ".join(job.get("skills", []) or [])
+    return " ".join([title, description, skills]).strip()
+
+
+def match_jobs_with_ml(skills):
+    """Rank job roles using sentence-transformers embeddings and cosine similarity with a keyword fallback."""
+    if not _JOB_CATALOG:
         return []
 
-    resume_vector = _EMBEDDING_MODEL.encode([resume_text], convert_to_numpy=True)
-    job_vectors = _EMBEDDING_MODEL.encode(job_profiles, convert_to_numpy=True)
-    similarities = np.dot(job_vectors, resume_vector.T).reshape(-1)
-    ranked = sorted(zip(_JOB_CATALOG, similarities), key=lambda item: item[1], reverse=True)
-    return ranked
+    resume_text = (
+        " ".join(skill.lower() for skill in skills if skill)
+        if skills
+        else "software developer engineer"
+    )
+    resume_tokens = set(_normalize_text(resume_text).split())
+
+    if _EMBEDDING_MODEL is not None:
+        job_texts = [_build_job_search_text(job) for job in _JOB_CATALOG]
+        resume_vector = _EMBEDDING_MODEL.encode(
+            [resume_text], convert_to_numpy=True, normalize_embeddings=True
+        )[0]
+        job_vectors = _EMBEDDING_MODEL.encode(
+            job_texts, convert_to_numpy=True, normalize_embeddings=True
+        )
+        similarities = np.dot(job_vectors, resume_vector)
+        ranked = sorted(
+            zip(_JOB_CATALOG, similarities), key=lambda item: item[1], reverse=True
+        )
+        return ranked
+
+    ranked = []
+    for job in _JOB_CATALOG:
+        job_text = _build_job_search_text(job)
+        job_tokens = set(_normalize_text(job_text).split())
+        score = len(resume_tokens & job_tokens) / max(1, len(job_tokens))
+        ranked.append((job, float(score)))
+    return sorted(ranked, key=lambda item: item[1], reverse=True)
 
 
-def recommend_job(skills, algorithm='balanced'):
-    """Suggest a job role using the ML-based matcher and keep the algorithm selector for compatibility."""
+def recommend_job(skills, algorithm="balanced", top_k=3):
+    """Suggest the most relevant jobs using vector similarity search and a simple compatibility threshold."""
     ranked_jobs = match_jobs_with_ml(skills)
     if not ranked_jobs:
-        return 'Software Developer'
+        return []
 
-    best_role, best_score = ranked_jobs[0]
-    if best_score < 0.05:
-        return 'Software Developer'
+    threshold_map = {
+        "strict": 0.18,
+        "advanced": 0.12,
+        "balanced": 0.05,
+    }
+    threshold = threshold_map.get(
+        (algorithm or "balanced").lower(), threshold_map["balanced"]
+    )
 
-    if algorithm == 'strict' and best_score < 0.15:
-        return 'Software Developer'
+    recommendations = []
+    for job, score in ranked_jobs:
+        if score < threshold and not recommendations:
+            continue
+        recommendations.append(
+            {
+                "title": job["title"],
+                "description": job["description"],
+                "skills": job.get("skills", []),
+                "score": float(score),
+            }
+        )
+        if len(recommendations) >= max(1, int(top_k)):
+            break
+    return recommendations
 
-    return best_role['title']
+
+def generate_ai_explanation(user_skills, recommendation, include_ai=False):
+    """Return a compact explanation for a job recommendation, optionally with an AI-style tone."""
+    if not recommendation:
+        return "No recommendation available yet."
+
+    user_skills = [skill.lower() for skill in (user_skills or []) if skill]
+    recommendation_skills = [
+        skill.lower() for skill in recommendation.get("skills", []) if skill
+    ]
+    matched = sorted(set(user_skills).intersection(set(recommendation_skills)))
+    missing = sorted(set(recommendation_skills) - set(user_skills))
+
+    if include_ai:
+        if matched:
+            return (
+                f"Based on your background, {recommendation.get('title', 'this role')} looks like a strong fit. "
+                f"Your experience with {', '.join(matched[:3])} aligns well with the role's core requirements."
+            )
+        return (
+            f"Based on your background, {recommendation.get('title', 'this role')} is a reasonable next step. "
+            "The role appears to value skills that are relevant to your experience."
+        )
+
+    explanation = (
+        f"{recommendation.get('title', 'This role')} is a strong fit because your resume highlights "
+        f"{', '.join(matched) if matched else 'relevant technical strengths'}."
+    )
+    if missing:
+        explanation += (
+            f" Consider strengthening {', '.join(missing[:3])} to improve your fit."
+        )
+    return explanation
 
 
 welcome_template = """
@@ -334,46 +556,103 @@ resume_result_template = """
 
     {% if show_recommendation %}
       <div class="skills">
-        <strong>Recommended Job:</strong> {{ recommendation }}
+        # <strong>Recommended Jobs:</strong>
+        {% if recommendations %}
+<div class="skills">
+
+<h3>Top Job Matches</h3>
+
+{% for job in recommendations %}
+
+<p>
+<b>{{ job.title }}</b><br>
+Similarity Score:
+{{ "%.2f"|format(job.score*100) }}%
+</p>
+
+{% endfor %}
+
+<h3>AI Career Advice</h3>
+
+<p>{{ ai_explanation }}</p>
+
+</div>
+{% endif %}
+        <ol style="margin:8px 0 0 20px; padding:0;">
+          {% for item in recommendation %}
+            <li style="margin-bottom:10px;">
+              <strong>{{ item.title }}</strong><br>
+              <small>Match: {{ '%.1f'|format(item.score * 100) }}%</small><br>
+              {{ item.description }}
+            </li>
+          {% endfor %}
+        </ol>
       </div>
+      {% if ai_explanation %}
+        <div class="skills">
+          <strong>Why this role?</strong><br>
+          {{ ai_explanation }}
+        </div>
+      {% endif %}
     {% endif %}
   </div>
 </body>
 </html>
 """
 
-@app.route('/resume_result', methods=['GET'])
+
+@app.route("/resume_result", methods=["GET"])
 def resume_result():
     """
     Show the uploaded resume details and allow skill extraction on demand.
     """
-    resume_id = request.args.get('resume_id', '')
-    if not session.get('logged_in'):
-        flash('Please login first to view the resume result.', 'error')
-        return redirect(url_for('login'))
+    resume_id = request.args.get("resume_id", "")
+    if not session.get("logged_in"):
+        flash("Please login first to view the resume result.", "error")
+        return redirect(url_for("login"))
 
-    username = session.get('username', request.args.get('username', 'User'))
-    show_skills = request.args.get('show_skills', '0') == '1'
-    show_score = request.args.get('show_score', '0') == '1'
-    show_recommendation = request.args.get('show_recommendation', '0') == '1'
+    username = session.get("username", request.args.get("username", "User"))
+    show_skills = request.args.get("show_skills", "0") == "1"
+    show_score = request.args.get("show_score", "0") == "1"
+    show_recommendation = request.args.get("show_recommendation", "0") == "1"
 
     if not resume_id:
-        flash('Resume information is missing.', 'error')
-        return redirect(url_for('welcome', username=username))
+        flash("Resume information is missing.", "error")
+        return redirect(url_for("welcome", username=username))
 
     resume_item = get_resume_record(resume_id)
     if not resume_item:
-        flash('Resume could not be found.', 'error')
-        return redirect(url_for('welcome', username=username))
+        flash("Resume could not be found.", "error")
+        return redirect(url_for("welcome", username=username))
 
-    skills = resume_item.get('skills', []) if show_skills or show_score or show_recommendation else []
-    text = resume_item.get('filename', '')
-    score = calculate_resume_score(skills, text) if (show_score or show_recommendation) else None
-    matching_algorithm = resume_item.get('matching_algorithm', 'balanced')
-    recommendation = recommend_job(skills, matching_algorithm) if show_recommendation else None
+    skills = (
+        resume_item.get("skills", [])
+        if show_skills or show_score or show_recommendation
+        else []
+    )
+    text = resume_item.get("filename", "")
+    score = (
+        calculate_resume_score(skills, text)
+        if (show_score or show_recommendation)
+        else None
+    )
+    matching_algorithm = resume_item.get("matching_algorithm", "balanced")
+    recommendation = (
+        recommend_job(skills, matching_algorithm, top_k=3)
+        if show_recommendation
+        else None
+    )
+    ai_explanation = None
+    if recommendation:
+        ai_explanation = generate_ai_explanation(
+            skills,
+            recommendation[0],
+            include_ai=request.args.get("include_ai", "0") == "1",
+        )
+
     return render_template_string(
         resume_result_template,
-        filename=resume_item.get('filename', 'Resume'),
+        filename=resume_item.get("filename", "Resume"),
         username=username,
         resume_id=resume_id,
         skills=skills,
@@ -382,46 +661,53 @@ def resume_result():
         show_recommendation=show_recommendation,
         score=score,
         recommendation=recommendation,
+        ai_explanation=ai_explanation,
         matching_algorithm_label=matching_algorithm.title(),
     )
 
 
-@app.route('/welcome', methods=['GET', 'POST'])
+@app.route("/welcome", methods=["GET", "POST"])
 def welcome():
     """
     Render the welcome page and handle resume uploads.
     """
-    if not session.get('logged_in'):
-        flash('Please login first to access the home page.', 'error')
-        return redirect(url_for('login'))
+    if not session.get("logged_in"):
+        flash("Please login first to access the home page.", "error")
+        return redirect(url_for("login"))
 
-    username = session.get('username', request.args.get('username', 'User'))
-    user_email = session.get('email', request.args.get('email', 'unknown@example.com')).strip().lower()
+    username = session.get("username", request.args.get("username", "User"))
+    user_email = (
+        session.get("email", request.args.get("email", "unknown@example.com"))
+        .strip()
+        .lower()
+    )
 
-    if request.method == 'POST':
+    if request.method == "POST":
         print(f"[UPLOAD] {username} started resume upload")
-        matching_algorithm = request.form.get('matching_algorithm', 'balanced').strip().lower()
-        file = request.files.get('resume')
-        if not file or file.filename == '':
-            flash('Please choose a resume file.', 'error')
-            return redirect(url_for('welcome', username=username))
+        matching_algorithm = (
+            request.form.get("matching_algorithm", "balanced").strip().lower()
+        )
+        file = request.files.get("resume")
+        if not file or file.filename == "":
+            flash("Please choose a resume file.", "error")
+            return redirect(url_for("welcome", username=username))
 
         ext = os.path.splitext(file.filename)[1].lower()
         if ext not in _ALLOWED_EXTENSIONS:
-            flash('Only PDF or DOCX files are allowed.', 'error')
-            return redirect(url_for('welcome', username=username))
+            flash("Only PDF or DOCX files are allowed.", "error")
+            return redirect(url_for("welcome", username=username))
 
         file.stream.seek(0, os.SEEK_END)
         file_size = file.stream.tell()
         file.stream.seek(0)
         if file_size == 0:
-            flash('The selected resume is empty.', 'error')
-            return redirect(url_for('welcome', username=username))
+            flash("The selected resume is empty.", "error")
+            return redirect(url_for("welcome", username=username))
         if file_size > _MAX_FILE_SIZE:
-            flash('Resume file size must be 5 MB or less.', 'error')
-            return redirect(url_for('welcome', username=username))
+            flash("Resume file size must be 5 MB or less.", "error")
+            return redirect(url_for("welcome", username=username))
 
-        upload_folder = os.path.join(os.getcwd(), 'uploads')
+        upload_folder = os.path.join(os.getcwd(), "uploads")
         os.makedirs(upload_folder, exist_ok=True)
         file_path = os.path.join(upload_folder, file.filename)
         file.save(file_path)
@@ -434,37 +720,53 @@ def welcome():
             extracted_text = extract_text_from_resume(file_path, ext)
             extracted_skills = extract_skills(extracted_text)
             resume_id = str(uuid.uuid4())
-            resume_table.put_item(Item={
-                'resume_id': resume_id,
-                'username': username,
-                'filename': file.filename,
-                'file_path': file_path,
-                'file_size': os.path.getsize(file_path),
-                'content_type': file.mimetype or 'application/octet-stream',
-                'content_base64': base64.b64encode(file_content).decode('utf-8'),
-                'skills': extracted_skills,
-                'matching_algorithm': matching_algorithm,
-                'uploaded_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-            })
-            skills_table.put_item(Item={
-                'user_email': user_email,
-                'username': username,
-                'skills': extracted_skills,
-                'updated_at': datetime.datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
-            })
-            print(f"[UPLOAD SUCCESS] {username} uploaded {file.filename} to {file_path} and extracted skills: {', '.join(extracted_skills) if extracted_skills else 'none'}")
-            flash('Resume uploaded successfully and saved to DynamoDB.', 'success')
-            return redirect(url_for('resume_result', resume_id=resume_id, username=username))
+            resume_table.put_item(
+                Item={
+                    "resume_id": resume_id,
+                    "username": username,
+                    "filename": file.filename,
+                    "file_path": file_path,
+                    "file_size": os.path.getsize(file_path),
+                    "content_type": file.mimetype or "application/octet-stream",
+                    "content_base64": base64.b64encode(file_content).decode("utf-8"),
+                    "skills": extracted_skills,
+                    "matching_algorithm": matching_algorithm,
+                    "uploaded_at": datetime.datetime.utcnow()
+                    .replace(microsecond=0)
+                    .isoformat()
+                    + "Z",
+                }
+            )
+            skills_table.put_item(
+                Item={
+                    "user_email": user_email,
+                    "username": username,
+                    "skills": extracted_skills,
+                    "updated_at": datetime.datetime.utcnow()
+                    .replace(microsecond=0)
+                    .isoformat()
+                    + "Z",
+                }
+            )
+            print(
+                f"[UPLOAD SUCCESS] {username} uploaded {file.filename} to {file_path} and extracted skills: {', '.join(extracted_skills) if extracted_skills else 'none'}"
+            )
+            flash("Resume uploaded successfully and saved to DynamoDB.", "success")
+            return redirect(
+                url_for("resume_result", resume_id=resume_id, username=username)
+            )
         except ClientError as e:
-            error_code = e.response['Error'].get('Code', 'Unknown')
-            error_message = e.response['Error'].get('Message', str(e))
-            print(f"[UPLOAD ERROR] {username} failed to save resume to DynamoDB: {error_code} - {error_message}")
-            flash(f'DynamoDB Error [{error_code}]: {error_message}', 'error')
+            error_code = e.response["Error"].get("Code", "Unknown")
+            error_message = e.response["Error"].get("Message", str(e))
+            print(
+                f"[UPLOAD ERROR] {username} failed to save resume to DynamoDB: {error_code} - {error_message}"
+            )
+            flash(f"DynamoDB Error [{error_code}]: {error_message}", "error")
 
-        return redirect(url_for('welcome', username=username))
+        return redirect(url_for("welcome", username=username))
 
     return render_template_string(welcome_template, username=username)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)

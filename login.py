@@ -1,19 +1,30 @@
 """Flask login page for user authentication."""
 
 from flask import Flask, render_template_string, request, redirect, url_for, flash, session
-import boto3
-from boto3.dynamodb.conditions import Attr
 from werkzeug.security import check_password_hash
-from botocore.exceptions import ClientError
 import Register
 import welcome as welcome_page
+
+try:
+    import boto3
+    from boto3.dynamodb.conditions import Attr
+    from botocore.exceptions import ClientError
+except Exception as exc:
+    boto3 = None
+    Attr = None
+    ClientError = Exception
+    print(f"[AWS IMPORT ERROR] {exc}")
 
 app = Flask(__name__)
 app.secret_key = 'Ffe6dXyDaFb9eqVyHinxT04U9I9/80PDyS/roJLH'
 
 # AWS DynamoDB setup
-dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-table = dynamodb.Table('users')
+if boto3 is None:
+    dynamodb = None
+    table = None
+else:
+    dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+    table = dynamodb.Table('users')
 
 login_template = """
 <!DOCTYPE html>
@@ -138,6 +149,10 @@ def login():
     if request.method == 'POST':
         email = request.form.get('email', '').strip().lower()
         password = request.form.get('password', '')
+
+        if table is None:
+            flash('Authentication is unavailable because AWS services could not be loaded.', 'error')
+            return redirect(url_for('login'))
 
         try:
             response = table.scan(FilterExpression=Attr('email').eq(email))

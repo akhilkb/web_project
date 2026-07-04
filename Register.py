@@ -1,19 +1,29 @@
 """Flask registration page for new users."""
 
 from flask import Flask, render_template_string, request, redirect, url_for, flash
-import boto3
 import uuid
-from boto3.dynamodb.conditions import Attr
 from werkzeug.security import generate_password_hash
-from botocore.exceptions import ClientError
+
+try:
+    import boto3
+    from boto3.dynamodb.conditions import Attr
+    from botocore.exceptions import ClientError
+except Exception as exc:
+    boto3 = None
+    Attr = None
+    ClientError = Exception
+    print(f"[AWS IMPORT ERROR] {exc}")
 
 app = Flask(__name__)
 app.secret_key = 'Ffe6dXyDaFb9eqVyHinxT04U9I9/80PDyS/roJLH'
 
 # AWS DynamoDB setup
-dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-
-table = dynamodb.Table('users')
+if boto3 is None:
+    dynamodb = None
+    table = None
+else:
+    dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+    table = dynamodb.Table('users')
 
 # HTML template
 register_template = """
@@ -83,6 +93,15 @@ register_template = """
  text-decoration:none;
  }
 
+ .secondary-button {
+ background:#007bff;
+ margin-top:8px;
+ }
+
+ .secondary-button:hover {
+ background:#0056b3;
+ }
+
  </style>
  </head>
 
@@ -101,6 +120,9 @@ register_template = """
 <input type="password" name="password" id="password" placeholder="Password" required>
 <button type="submit">Register</button>
 </form>
+<a class="link" href="/login">
+<button type="button" class="secondary-button">Login</button>
+</a>
 <script>
 function validateForm() {
   const username = document.getElementById('username').value.trim();
@@ -152,6 +174,10 @@ def register():
 
         if len(password) < 6:
             flash("Password must be at least 6 characters long", "error")
+            return redirect(url_for('register'))
+
+        if table is None:
+            flash("Registration is temporarily unavailable because AWS services could not be loaded.", "error")
             return redirect(url_for('register'))
 
         hashed_password = generate_password_hash(password)
